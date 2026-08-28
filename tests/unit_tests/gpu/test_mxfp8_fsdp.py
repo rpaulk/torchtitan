@@ -13,7 +13,7 @@ import torch.multiprocessing as mp
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.elastic.utils.distributed import get_free_port
 from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Shard
 
 
 pytest.importorskip("torchao")
@@ -673,6 +673,132 @@ def _run_grouped_experts_pp_cache_lifecycle(
     finally:
         mxfp8_tensor._quantize_mxfp8_grouped_weight = original_quantize
         dist.destroy_process_group()
+
+
+def _run_grouped_experts_uneven_shard_dim0(
+    rank: int,
+    world_size: int,
+    port: int,
+) -> None:
+    """Expert count that does not divide the FSDP degree.
+
+    FSDP pads the last shard, so ``fsdp_pre_all_gather`` returns the padded
+    shard and carries the logical size in metadata; ``fsdp_post_all_gather``
+    narrows the padding away before quantizing. Were the padding to reach the
+    quantizer it would occupy real 32x32 scale tiles and show up as extra
+    experts, so this checks the gradients too rather than just completion.
+    """
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    try:
+        mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp_shard",))
+        # 1 expert over 2 ranks: dim 0 does not divide, so FSDP pads. The
+        # expert count has to stay a power of two because TorchAO's scale
+        # rearrange kernel does tl.arange over the token groups.
+        num_experts, dim, hidden_dim = 1, 128, 256
+        experts = _make_grouped_experts(num_experts, dim, hidden_dim)
+        fully_shard(
+            experts,
+            mesh=mesh,
+            mp_policy=MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16
+            ),
+            reshard_after_forward=True,
+        )
+        tokens_per_expert = 128
+        x_RD = torch.randn(
+            num_experts * tokens_per_expert,
+            dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        counts = torch.full(
+            (num_experts,), tokens_per_expert, device="cuda", dtype=torch.int32
+        )
+        experts(x_RD, counts).sum().backward()
+
+        assert x_RD.grad is not None
+        assert torch.isfinite(x_RD.grad).all()
+        for name, parameter in experts.named_parameters():
+            assert parameter.grad is not None, name
+            assert parameter.grad.shape == parameter.shape, name
+            assert torch.isfinite(parameter.grad.to_local()).all(), name
+    finally:
+        dist.destroy_process_group()
+
+
+def _run_grouped_experts_shard_dim1(
+    rank: int,
+    world_size: int,
+    port: int,
+) -> None:
+    """FSDP degree above the expert count, so torchtitan shards the hidden dim.
+
+    ``apply_fsdp_to_decoder`` selects ``Shard(1)`` when ``efsdp * ep`` exceeds
+    the expert count, which any job with more ranks than experts hits. The
+    all-gather then concatenates dim-1 shards along dim 0, so the hook has to
+    rebuild the logical weight before quantizing. It assumes dim 0 instead.
+    """
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = str(port)
+    torch.cuda.set_device(rank)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    try:
+        mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("dp_shard",))
+        num_experts, dim, hidden_dim = 1, 128, 256
+        experts = _make_grouped_experts(num_experts, dim, hidden_dim)
+        fully_shard(
+            experts,
+            mesh=mesh,
+            mp_policy=MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16, reduce_dtype=torch.bfloat16
+            ),
+            shard_placement_fn=lambda _param: Shard(1),
+            reshard_after_forward=True,
+        )
+        tokens_per_expert = 256
+        x_RD = torch.randn(
+            num_experts * tokens_per_expert,
+            dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        counts = torch.full(
+            (num_experts,), tokens_per_expert, device="cuda", dtype=torch.int32
+        )
+        experts(x_RD, counts).sum().backward()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_mxfp8_grouped_experts_uneven_shard_dim0():
+    """An expert count that does not divide the FSDP degree still trains."""
+    mp.spawn(
+        _run_grouped_experts_uneven_shard_dim0,
+        args=(2, get_free_port()),
+        nprocs=2,
+        join=True,
+    )
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="unsharded tensors support sharding dimension 0 only",
+)
+def test_mxfp8_grouped_experts_shard_dim1():
+    """Shard(1), which torchtitan picks when the FSDP degree exceeds experts.
+
+    The all-gather concatenates dim-1 shards along dim 0, so the hook would
+    have to rebuild the logical weight before quantizing. It rejects this
+    explicitly instead; remove the xfail when it is supported.
+    """
+    mp.spawn(
+        _run_grouped_experts_shard_dim1, args=(2, get_free_port()), nprocs=2, join=True
+    )
 
 
 @pytest.mark.parametrize(
