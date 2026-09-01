@@ -19,6 +19,7 @@ resolution lives in ``forward`` or in ``preprocess_inputs``.
 """
 
 import unittest
+from unittest import mock
 
 import torch
 from torch import nn
@@ -128,6 +129,85 @@ class TestQwen35MRoPEPositions(unittest.TestCase):
         self.assertEqual(
             batch["attention_masks"]["deltanet"].cu_seq_q_host, (0, 3, 5, 10)
         )
+
+    def test_context_parallel_context_is_built_before_input_sharding(self):
+        import spmd_types as spmd
+
+        from torchtitan.distributed.parallel_dims import MeshAxisName
+        from torchtitan.distributed.spmd_types import _per_axis_types
+        from torchtitan.models.common.attention import VarlenMetadata
+
+        model, _sink, _parallel_dims, parallelism = self._build_stub_model()
+        positions = torch.arange(8, dtype=torch.int32)
+        cu_seqlens = torch.tensor([0, 8], dtype=torch.int32)
+        deltanet_metadata = VarlenMetadata(
+            cu_seq_q=cu_seqlens,
+            cu_seq_k=cu_seqlens,
+            max_q=8,
+            max_k=8,
+            cu_seq_q_host=(0, 8),
+        )
+        attention_masks = {
+            "quadratic_attention": None,
+            "deltanet": deltanet_metadata,
+        }
+        cp_mesh = mock.Mock()
+        cp_mesh.size.return_value = 2
+        cp_group = mock.sentinel.cp_group
+        cp_mesh.get_group.return_value = cp_group
+        parallel_dims = mock.Mock()
+        parallel_dims.cp_enabled = True
+        parallel_dims.get_mesh.return_value = cp_mesh
+        parallelism.context_parallel_load_balancer = None
+        cp_context = mock.sentinel.cp_context
+        input_dict = {
+            "input": torch.randint(0, 100, (8,)),
+            "positions": positions,
+            "labels": torch.zeros(8),
+            "pixel_values": torch.randn(4, 8),
+            "grid_thw": torch.tensor([[1, 2, 2]]),
+        }
+
+        with (
+            mock.patch.object(
+                model,
+                "get_attention_masks",
+                return_value=attention_masks,
+            ),
+            mock.patch(
+                "torchtitan.models.qwen3_5.model.build_cp_context",
+                return_value=cp_context,
+            ) as build_context,
+            mock.patch(
+                "torchtitan.distributed.context_parallel.api.prepare_context_parallel_input",
+                side_effect=lambda batch, *_args: batch,
+            ) as prepare_cp_input,
+        ):
+            _inputs, _labels, batch = model.preprocess_inputs(
+                input_dict,
+                parallel_dims=parallel_dims,
+                parallelism=parallelism,
+            )
+
+        self.assertIs(batch["attention_masks"]["deltanet_cp_context"], cp_context)
+        build_context.assert_called_once()
+        args, kwargs = build_context.call_args
+        self.assertIs(args[0], cu_seqlens)
+        self.assertIs(kwargs["group"], cp_group)
+        self.assertEqual(kwargs["conv1d_kernel_size"], model.gdn_conv_kernel_size)
+        torch.testing.assert_close(
+            kwargs["cu_seqlens_cpu"], torch.tensor([0, 8], dtype=torch.long)
+        )
+
+        input_sharding = prepare_cp_input.call_args.args[1]
+        self.assertEqual(
+            _per_axis_types(input_sharding["input"])[MeshAxisName.CP], spmd.R
+        )
+        self.assertEqual(
+            _per_axis_types(input_sharding["pixel_values"])[MeshAxisName.CP],
+            spmd.R,
+        )
+        self.assertIs(batch["pixel_values"], input_dict["pixel_values"])
 
 
 if __name__ == "__main__":

@@ -144,7 +144,9 @@ class ReferenceGatedDeltaKernel(nn.Module):
         *,
         cu_seqlens: torch.Tensor | None = None,
         cu_seqlens_cpu: torch.Tensor | None = None,
+        cp_context: object | None = None,
     ) -> torch.Tensor:
+        assert cp_context is None
         if xq_THK.shape[1] != xv_THV.shape[1]:
             assert xv_THV.shape[1] % xq_THK.shape[1] == 0
             repeat = xv_THV.shape[1] // xq_THK.shape[1]
@@ -168,6 +170,41 @@ class ReferenceGatedDeltaKernel(nn.Module):
 
 
 class TestQwen35DeltaNetVarlen(unittest.TestCase):
+    def test_chunk_kernel_forwards_cp_context(self):
+        try:
+            from torchtitan.models.qwen3_5 import GatedDeltaKernel
+        except ModuleNotFoundError as exc:
+            raise unittest.SkipTest(
+                f"Qwen3.5 optional dependency unavailable: {exc.name}"
+            ) from exc
+
+        kernel = GatedDeltaKernel(GatedDeltaKernel.Config(backend="fla_chunked"))
+        xq_THK = torch.randn(8, 2, 4)
+        xk_THK = torch.randn(8, 2, 4)
+        xv_THV = torch.randn(8, 2, 4)
+        g_TH = torch.randn(8, 2)
+        beta_TH = torch.randn(8, 2)
+        cp_context = mock.sentinel.cp_context
+
+        with mock.patch(
+            "torchtitan.models.qwen3_5.gdn._fla_chunk_gated_delta_rule",
+            return_value=(xv_THV.unsqueeze(0), None),
+        ) as chunk_gated_delta_rule:
+            output_THV = kernel(
+                xq_THK,
+                xk_THK,
+                xv_THV,
+                g_TH,
+                beta_TH,
+                cp_context=cp_context,
+            )
+
+        torch.testing.assert_close(output_THV, xv_THV)
+        kwargs = chunk_gated_delta_rule.call_args.kwargs
+        self.assertIs(kwargs["cp_context"], cp_context)
+        self.assertIsNone(kwargs["cu_seqlens"])
+        self.assertIsNone(kwargs["cu_seqlens_cpu"])
+
     def test_flex_masks_ignore_padding_position_resets(self):
         try:
             from torchtitan.models.common.decoder import Decoder

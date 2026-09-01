@@ -62,6 +62,7 @@ pip install av torchvision flash-linear-attention
 |---------|-------|
 | FSDP / HSDP | Decoder sharded per-layer; vision encoder sharded as a single unit (one AllGather) |
 | Tensor Parallelism (TP) | With Sequence Parallel; head-sharded TP on GatedDeltaNet projections |
+| Context Parallelism (CP) | Text and multimodal; vision embeddings are scattered into the complete sequence before decoder CP sharding. GatedDeltaNet uses FLA CP and requires `fla_chunked` with `context_parallel_load_balancer=None` |
 | Expert Parallelism (EP) | For MoE variants |
 | Pipeline Parallel (PP) | Vision encoder assigned to first stage; 1F1B and Interleaved1F1B schedules |
 | Sample Packing | Opt-in via `MMSamplePackingConfig` |
@@ -79,4 +80,3 @@ Test scripts:
 ## TODO
 
 - Add video dataset training configs
-- Add Context Parallel (CP) support

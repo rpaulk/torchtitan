@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from collections.abc import Mapping
 from typing import Any, cast, TYPE_CHECKING
 
 import spmd_types as spmd
@@ -71,7 +72,8 @@ def prepare_context_parallel_input(
             'labels', and any extra kwargs. Tensor entries named in
             ``shard_dims`` (e.g. 'input', 'labels', 'positions') are sharded and
             written back; 'attention_masks', if present, is sharded along its Q
-            seq dim.
+            seq dim. In a mixed mapping, non-``BlockMask`` metadata is preserved
+            unchanged for model-specific CP implementations.
         input_shardings: Per-input SPMD layout; the CP sequence dim for each
             input is derived via ``_cp_shard_dims`` (inputs whose CP axis is
             Replicate/Partial are omitted and left untouched). When None,
@@ -141,8 +143,9 @@ def cp_shard(
         cp_mesh: Device mesh for context parallel dimension
         inputs: Tuple of input tensors to be sharded along the sequence
             dimension
-        attention_masks: Attention masks to be sharded. Supports None,
-            BlockMask, or dict[str, BlockMask]
+        attention_masks: Attention masks to be sharded. Supports ``None``, a
+            ``BlockMask``, or a mapping containing ``BlockMask`` values and
+            model-specific metadata. Only ``BlockMask`` values are sharded.
         load_balancer_type: Type of load balancer to use. Options:
             - "headtail": Use HeadTailLoadBalancer (for SDPA)
             - "ptrr": Use PTRRLoadBalancer (for FlexAttention)
@@ -197,7 +200,7 @@ def cp_shard(
                         "PTRRLoadBalancer requires attention_masks to be a "
                         "BlockMask or dict[str, BlockMask], but got None"
                     )
-                if isinstance(attention_masks, dict):
+                if isinstance(attention_masks, Mapping):
                     if ptrr_mask_key is None:
                         raise ValueError(
                             "PTRRLoadBalancer received a dict[str, BlockMask] "
@@ -236,36 +239,35 @@ def cp_shard(
         ),
     )
 
-    # BlockMask, has shape, [B, H, Q, KV], and we can only shard
-    # on the Q seq dimension, not KV.
+    # BlockMask has shape [B, H, Q, KV], and we can only shard on the Q
+    # sequence dimension, not KV. Preserve non-BlockMask entries in mixed
+    # mappings; model-specific linear-attention metadata remains global or
+    # rank-local according to its own CP implementation.
     MASK_Q_SEQ_DIM = 2
-    if attention_masks is not None:
-        assert isinstance(attention_masks, (BlockMask, dict))
-        masks: list[BlockMask] = []
-        for mask in (
-            [attention_masks]
-            if isinstance(attention_masks, BlockMask)
-            else attention_masks.values()
-        ):
-            if not isinstance(mask, BlockMask):
-                raise ValueError(
-                    "Context parallelism can only shard BlockMask attention "
-                    f"masks, got {type(mask).__name__} in the mask dict."
-                )
-            masks.append(mask)
+    if isinstance(attention_masks, BlockMask):
         sharded_masks = _context_parallel_shard(
             mesh=cp_mesh,
-            buffers=masks,
-            seq_dims=(MASK_Q_SEQ_DIM,) * len(masks),
+            buffers=[attention_masks],
+            seq_dims=[MASK_Q_SEQ_DIM],
             load_balancer=load_balancer,
         )
-        attention_masks = cast(
-            (BlockMask | dict[str, BlockMask]),
-            (
-                sharded_masks[0]
-                if isinstance(attention_masks, BlockMask)
-                else {k: v for k, v in zip(attention_masks.keys(), sharded_masks)}
-            ),
+        attention_masks = cast(BlockMask, sharded_masks[0])
+    elif isinstance(attention_masks, Mapping):
+        block_mask_items = [
+            (key, mask)
+            for key, mask in attention_masks.items()
+            if isinstance(mask, BlockMask)
+        ]
+        if not block_mask_items:
+            return inputs, attention_masks
+        sharded_masks = _context_parallel_shard(
+            mesh=cp_mesh,
+            buffers=[mask for _, mask in block_mask_items],
+            seq_dims=(MASK_Q_SEQ_DIM,) * len(block_mask_items),
+            load_balancer=load_balancer,
         )
+        attention_masks = dict(attention_masks)
+        for (key, _), sharded_mask in zip(block_mask_items, sharded_masks, strict=True):
+            attention_masks[key] = cast(BlockMask, sharded_mask)
 
     return inputs, attention_masks

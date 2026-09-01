@@ -275,6 +275,14 @@ class TestSpmdLayout(DTensorTestBase):
             attention_activation_placement().partition_spec,
             ((MeshAxisName.DP, MeshAxisName.CP), MeshAxisName.TP, None),
         )
+        self.assertEqual(
+            token_id_placement(cp=spmd.R).partition_spec,
+            (MeshAxisName.DP,),
+        )
+        self.assertEqual(
+            _per_axis_types(token_id_placement(cp=spmd.R))[MeshAxisName.CP],
+            spmd.R,
+        )
 
     def test_unfold_dp_axes(self):
         """Logical DP expands only when resolving concrete mesh axes."""

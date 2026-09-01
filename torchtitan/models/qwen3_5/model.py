@@ -5,11 +5,12 @@
 # LICENSE file in the root directory of this source tree.
 
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, cast
 
 import spmd_types as spmd
 import torch
+from fla.ops.cp import build_cp_context, FLACPContext
 from spmd_types import SpmdType
 from torch import nn
 from torch.nn.attention.flex_attention import BlockMask
@@ -37,6 +38,7 @@ from torchtitan.models.common.multimodal import (
     multimodal_context,
     scatter_vision_embeds,
 )
+from torchtitan.models.common.nn_modules import Identity
 from torchtitan.models.common.vision_encoder_sharding import multimodal_input_sharding
 from torchtitan.models.utils import (
     delta_rule_flops_per_token,
@@ -45,7 +47,7 @@ from torchtitan.models.utils import (
 )
 from torchtitan.protocols.module import Module
 
-from .gdn import GatedDeltaNet
+from .gdn import GatedDeltaKernel, GatedDeltaNet, InnerGatedDeltaNet
 from .rope import MRoPE
 from .sharding import annotate_deltanet_cu_seqlens, set_qwen35_sharding_config
 from .vision_encoder import Qwen35VisionEncoder
@@ -56,7 +58,7 @@ from .vision_encoder import Qwen35VisionEncoder
 # K = query/key head dimension, V = value head dimension,
 # R = rotary dimension, P = non-rotary dimension.
 
-Qwen35AttentionMaskDict = dict[str, BlockMask | VarlenMetadata | None]
+Qwen35AttentionMaskDict = dict[str, BlockMask | VarlenMetadata | FLACPContext | None]
 
 
 class OffsetRMSNorm(Module):
@@ -227,14 +229,37 @@ class Qwen35TransformerBlock(Module):
         attention_masks: Qwen35AttentionMaskDict | None,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        layer_mask = (
-            attention_masks[self.attn_mask_key] if attention_masks is not None else None
-        )
         h_TD = self.attention_norm(x_TD)
         if self.full_attn:
+            layer_mask = (
+                attention_masks[self.attn_mask_key]
+                if attention_masks is not None
+                else None
+            )
+            assert isinstance(layer_mask, (BlockMask, VarlenMetadata)) or (
+                layer_mask is None
+            )
             h_TD = self.attn(h_TD, layer_mask, positions)
         else:
-            h_TD = self.attn(h_TD, layer_mask)
+            deltanet_metadata = (
+                attention_masks[self.attn_mask_key]
+                if attention_masks is not None
+                else None
+            )
+            cp_context = (
+                attention_masks.get("deltanet_cp_context")
+                if attention_masks is not None
+                else None
+            )
+            assert isinstance(deltanet_metadata, VarlenMetadata) or (
+                deltanet_metadata is None
+            )
+            assert isinstance(cp_context, FLACPContext) or cp_context is None
+            h_TD = self.attn(
+                h_TD,
+                deltanet_metadata,
+                cp_context=cp_context,
+            )
         x_TD = x_TD + h_TD
 
         h_TD = self.ffn_norm(x_TD)
@@ -281,6 +306,8 @@ class Qwen35Model(Decoder):
           │    ├─ get_vision_positions              → locate vision regions
           │    └─ _scatter_vision_embeds                → scatter into text sequence
           │
+          ├─ decoder_input_reshard                  CP-shard fused embeddings
+          │
           └─ transformer layers (hybrid), each given ``positions`` (3D or 2D)
                └─ for each layer:
                     ├─ full attention (every Nth):  QK-norm → partial RoPE → SDPA → gate
@@ -291,6 +318,7 @@ class Qwen35Model(Decoder):
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
         vision_encoder: Qwen35VisionEncoder.Config
+        decoder_input_reshard: Identity.Config = field(default_factory=Identity.Config)
 
         def update_from_config(
             self,
@@ -300,6 +328,29 @@ class Qwen35Model(Decoder):
         ) -> None:
             Decoder.Config.update_from_config(self, config=config, **kwargs)
             parallelism = config.parallelism
+
+            if (
+                parallelism.context_parallel_degree > 1
+                and parallelism.context_parallel_load_balancer is not None
+            ):
+                raise ValueError(
+                    "Qwen3.5 GatedDeltaNet context parallelism requires "
+                    "context_parallel_load_balancer=None because FLA CP uses "
+                    "contiguous sequence shards."
+                )
+            if parallelism.context_parallel_degree > 1:
+                for layer in self.layers:
+                    if layer.delta_net is None:
+                        continue
+                    inner_config = layer.delta_net.inner_gated_delta_net
+                    assert isinstance(inner_config, InnerGatedDeltaNet.Config)
+                    kernel_config = inner_config.kernel
+                    assert isinstance(kernel_config, GatedDeltaKernel.Config)
+                    if kernel_config.backend != "fla_chunked":
+                        raise ValueError(
+                            "Qwen3.5 GatedDeltaNet context parallelism requires "
+                            "the fla_chunked backend."
+                        )
 
             tp = parallelism.tensor_parallel_degree
             if tp > 1:
@@ -365,7 +416,20 @@ class Qwen35Model(Decoder):
         super().__init__(config)
 
         self.vision_encoder = config.vision_encoder.build()
+        self.decoder_input_reshard = config.decoder_input_reshard.build()
         self.spatial_merge_size = config.vision_encoder.spatial_merge_size
+        deltanet_configs = [
+            layer.delta_net for layer in config.layers if layer.delta_net is not None
+        ]
+        assert deltanet_configs, "Qwen3.5 must contain GatedDeltaNet layers."
+        conv_kernel_sizes = {
+            deltanet_config.conv_kernel_size for deltanet_config in deltanet_configs
+        }
+        assert len(conv_kernel_sizes) == 1, (
+            "All Qwen3.5 GatedDeltaNet layers must use the same convolution "
+            "kernel size."
+        )
+        self.gdn_conv_kernel_size = next(iter(conv_kernel_sizes))
 
     def preprocess_inputs(
         self,
@@ -374,7 +438,7 @@ class Qwen35Model(Decoder):
         parallel_dims: ParallelDims,
         parallelism: ParallelismConfig,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        """Build masks, CP-shard, SPMD-wrap (+ deltanet annotation), and return."""
+        """Build masks, CP-shard decoder inputs, annotate SPMD types, and return."""
         # Function-local import avoids a circular import.
         from torchtitan.distributed.context_parallel.api import (
             prepare_context_parallel_input,
@@ -389,7 +453,20 @@ class Qwen35Model(Decoder):
             if isinstance(inner, (FlexAttention.Config, VarlenAttention.Config)):
                 batch["attention_masks"] = self.get_attention_masks(positions=positions)
 
-        input_sharding = {**decoder_input_sharding(), **multimodal_input_sharding()}
+        input_sharding = {
+            **decoder_input_sharding(),
+            **multimodal_input_sharding(cp=spmd.R),
+        }
+        # Keep token IDs complete through embedding and vision scatter. The
+        # decoder_input_reshard boundary shards the fused embeddings afterward.
+        input_sharding["input"] = SpmdType(
+            {
+                MeshAxisName.DP: spmd.V,
+                MeshAxisName.CP: spmd.R,
+                MeshAxisName.TP: spmd.R,
+            },
+            partition_spec=spmd.PartitionSpec(MeshAxisName.DP),
+        )
 
         # RoPE uses the 3D MRoPE positions when present (multimodal), else the
         # same 2D positions. Collapse both into the single ``positions`` input.
@@ -415,7 +492,69 @@ class Qwen35Model(Decoder):
             "'positions' or 'mrope_positions'."
         )
         batch["positions"] = rope_positions
+        attention_masks = batch.get("attention_masks")
         if parallel_dims.cp_enabled:
+            if parallelism.context_parallel_load_balancer is not None:
+                raise ValueError(
+                    "Qwen3.5 GatedDeltaNet context parallelism requires "
+                    "context_parallel_load_balancer=None because FLA CP uses "
+                    "contiguous sequence shards."
+                )
+            if not isinstance(attention_masks, dict):
+                raise ValueError(
+                    "Qwen3.5 context parallelism requires attention metadata "
+                    "as a keyed mapping."
+                )
+            if positions is None:
+                raise ValueError(
+                    "Qwen3.5 context parallelism requires 1D text positions."
+                )
+
+            deltanet_metadata = attention_masks.get("deltanet")
+            if deltanet_metadata is None:
+                num_tokens = positions.shape[0]
+                cu_seqlens = torch.tensor(
+                    [0, num_tokens],
+                    dtype=torch.int32,
+                    device=positions.device,
+                )
+                deltanet_metadata = VarlenMetadata(
+                    cu_seq_q=cu_seqlens,
+                    cu_seq_k=cu_seqlens,
+                    max_q=num_tokens,
+                    max_k=num_tokens,
+                    cu_seq_q_host=(0, num_tokens),
+                )
+                attention_masks["deltanet"] = deltanet_metadata
+            if not isinstance(deltanet_metadata, VarlenMetadata):
+                raise ValueError(
+                    "Qwen3.5 context parallelism requires GatedDeltaNet "
+                    "VarlenMetadata."
+                )
+            if deltanet_metadata.cu_seq_q_host is None:
+                raise ValueError(
+                    "Qwen3.5 context parallelism requires host cu_seqlens."
+                )
+
+            cp_mesh = parallel_dims.get_mesh("cp")
+            num_tokens = deltanet_metadata.cu_seq_q_host[-1]
+            if num_tokens % cp_mesh.size() != 0:
+                raise ValueError(
+                    f"FLA context parallelism requires the token count "
+                    f"({num_tokens}) to be divisible by the CP degree "
+                    f"({cp_mesh.size()})."
+                )
+            cu_seqlens_cpu = torch.tensor(
+                deltanet_metadata.cu_seq_q_host,
+                dtype=torch.long,
+                device="cpu",
+            )
+            attention_masks["deltanet_cp_context"] = build_cp_context(
+                deltanet_metadata.cu_seq_q,
+                group=cp_mesh.get_group(),
+                conv1d_kernel_size=self.gdn_conv_kernel_size,
+                cu_seqlens_cpu=cu_seqlens_cpu,
+            )
             batch = prepare_context_parallel_input(
                 batch,
                 input_sharding,
@@ -591,6 +730,9 @@ class Qwen35Model(Decoder):
                 )
             else:
                 x = tokens
+
+        if self.tok_embeddings is not None:
+            x = self.decoder_input_reshard(x)
 
         if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
             spmd.assert_type(

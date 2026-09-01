@@ -156,10 +156,11 @@ def pipeline_vlm(
     (``tok_embeddings``, ``layers.*``, ``norm``, ``lm_head``). For a VLM we inject
     ``vision_encoder`` into the first stage's FQN list so it runs alongside
     ``tok_embeddings`` (vision features are scattered into the embedding sequence
-    before the decoder layers). On stages other than the first, ``tok_embeddings``
-    and ``vision_encoder`` are pruned to ``None``; each model's ``forward`` must
-    guard on ``self.tok_embeddings is not None`` so the multimodal logic is
-    skipped there.
+    before the decoder layers). A model-specific ``decoder_input_reshard`` module,
+    when present, is also kept with ``tok_embeddings`` so post-scatter CP sharding
+    runs on the first stage. On later stages these input modules are pruned to
+    ``None``; each model's ``forward`` must guard on
+    ``self.tok_embeddings is not None`` so the multimodal logic is skipped there.
 
     NOTE: This adds load to stage 0 that the auto split does not model
     (``input_weight`` only accounts for ``tok_embeddings``); for a heavy vision
@@ -178,9 +179,32 @@ def pipeline_vlm(
         )
         if model.vision_encoder is not None:
             fqn_per_part[0].insert(0, "vision_encoder")
-        parallelism = dataclasses.replace(
-            parallelism, module_fqns_per_model_part=fqn_per_part
+    else:
+        fqn_per_part = [
+            list(stage_fqns) for stage_fqns in parallelism.module_fqns_per_model_part
+        ]
+
+    if getattr(model, "decoder_input_reshard", None) is not None:
+        input_stage = next(
+            (
+                stage_fqns
+                for stage_fqns in fqn_per_part
+                if "tok_embeddings" in stage_fqns
+            ),
+            None,
         )
+        if input_stage is None:
+            raise ValueError(
+                "VLM pipeline partition must place tok_embeddings on a stage "
+                "before decoder_input_reshard can be assigned."
+            )
+        if "decoder_input_reshard" not in input_stage:
+            embedding_index = input_stage.index("tok_embeddings")
+            input_stage.insert(embedding_index + 1, "decoder_input_reshard")
+
+    parallelism = dataclasses.replace(
+        parallelism, module_fqns_per_model_part=fqn_per_part
+    )
 
     return pipeline_llm(
         model,

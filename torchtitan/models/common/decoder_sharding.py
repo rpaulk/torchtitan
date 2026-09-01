@@ -61,8 +61,17 @@ def dense_activation_placement(
     )
 
 
-def token_id_placement() -> SpmdType:
+def token_id_placement(*, cp: spmd.PerMeshAxisSpmdType = spmd.S(0)) -> SpmdType:
     """Placement for decoder token IDs with shape ``(tokens,)``."""
+    if not isinstance(cp, spmd.Shard):
+        return SpmdType(
+            {
+                DP: spmd.V,
+                CP: cp,
+                TP: spmd.R,
+            },
+            partition_spec=spmd.PartitionSpec(DP),
+        )
     return SpmdType(
         {
             DP: spmd.V,
@@ -272,7 +281,11 @@ def set_gqa_attention_sharding(attention_cfg, *, enable_sp: bool) -> None:
     attention_cfg.wo.sharding_config = wo_config
 
 
-def set_gqa_inner_attention_local_map(inner_attention_cfg) -> None:
+def set_gqa_inner_attention_local_map(
+    inner_attention_cfg,
+    *,
+    cp: spmd.PerMeshAxisSpmdType = spmd.S(0),
+) -> None:
     """Install a ``LocalMapConfig`` on an inner-attention config.
 
     q/k use ``(T, H, K)`` and v uses ``(T, H, V)``. DP/CP shard T and TP
@@ -285,16 +298,18 @@ def set_gqa_inner_attention_local_map(inner_attention_cfg) -> None:
     is multi-axis); under ``partial_dtensor``, the (tp,)-only mesh only
     consumes the ``TP`` placement and the rest are ignored.
 
-    With CP, q stays token-sharded on the CP axis while k/v are
-    unsharded (``R``) on CP -- the local_map boundary all-gathers k/v so the
-    kernel sees full-length keys (matching the BlockMask's kv dimension).
-    Q's local grad is naturally token-sharded; k/v's local grads accumulate as
-    partial (``P``) on CP and are reduced on the way out.
+    For decoder attention, the default keeps q token-sharded on CP while k/v
+    are unsharded so the kernel sees full-length keys. Vision callers pass
+    ``cp=R`` because every CP rank processes the complete vision sequence.
     """
-    q_placements = attention_activation_placement()
-    kv_src_placements = attention_activation_placement()
-    kv_dst_placements = attention_activation_placement(cp=spmd.R)
-    kv_grad_placements = attention_activation_placement(cp=spmd.P)
+    q_placements = attention_activation_placement(cp=cp)
+    kv_src_placements = attention_activation_placement(cp=cp)
+    if isinstance(cp, spmd.Shard):
+        kv_dst_placements = attention_activation_placement(cp=spmd.R)
+        kv_grad_placements = attention_activation_placement(cp=spmd.P)
+    else:
+        kv_dst_placements = kv_src_placements
+        kv_grad_placements = kv_src_placements
 
     out_src: SpmdType = q_placements
     inner_attention_cfg.sharding_config = ShardingConfig(

@@ -74,7 +74,11 @@ def annotate_deltanet_cu_seqlens(attention_masks: "Qwen35AttentionMaskDict") -> 
         return
     spmd.assert_type(
         deltanet_metadata.cu_seq_q,
-        {MeshAxisName.DP: spmd.V, MeshAxisName.TP: spmd.R},
+        {
+            MeshAxisName.DP: spmd.V,
+            MeshAxisName.CP: spmd.R,
+            MeshAxisName.TP: spmd.R,
+        },
     )
 
 
@@ -120,18 +124,26 @@ def set_qwen35_sharding_config(
 ) -> None:
     """Fill ``sharding_config`` on all Qwen3.5 sub-configs."""
     set_decoder_sharding_config(config, enable_sp=enable_sp)
-    # Vision scatter needs the full embedding sequence on every TP rank.
+    # Vision scatter needs the full embedding sequence on every CP/TP rank.
+    full_token_layout = token_id_placement(cp=spmd.R)
+    full_embedding_layout = dense_activation_placement(tp=spmd.R, cp=spmd.R)
     config.tok_embeddings.sharding_config = ShardingConfig(
         state_shardings={"weight": dense_param_placement(tp=spmd.S(0))},
-        in_src_shardings={"input": token_id_placement()},
-        in_dst_shardings={"input": token_id_placement()},
-        out_src_shardings=dense_activation_placement(tp=spmd.P, cp=spmd.S(0)),
-        out_dst_shardings=dense_activation_placement(tp=spmd.R, cp=spmd.S(0)),
+        in_src_shardings={"input": full_token_layout},
+        in_dst_shardings={"input": full_token_layout},
+        out_src_shardings=dense_activation_placement(tp=spmd.P, cp=spmd.R),
+        out_dst_shardings=full_embedding_layout,
         local_map=LocalMapConfig(in_grad_placements=None),
     )
+    cp_sharded_embedding_layout = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
+    config.decoder_input_reshard.sharding_config = ShardingConfig(
+        in_src_shardings={"input": full_embedding_layout},
+        in_dst_shardings={"input": cp_sharded_embedding_layout},
+        out_src_shardings=cp_sharded_embedding_layout,
+    )
     _set_vision_encoder_sharding(config.vision_encoder)
-    # The first layer restores the decoder layout after replicated vision scatter.
-    first_layer_input_layout = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
+    # CP sharding happens after vision scatter; layer 0 only restores TP/SP.
+    first_layer_input_layout = cp_sharded_embedding_layout
     layer_input_layout = (
         dense_sequence_parallel_placement()
         if enable_sp
@@ -247,26 +259,27 @@ def _set_vision_encoder_sharding(ve_cfg: "Qwen35VisionEncoder.Config") -> None:
     Norms are Replicate. pos_embed is Replicate via state_shardings.
     """
     ve_cfg.sharding_config = ShardingConfig(
-        state_shardings={"pos_embed": SpmdType({DP: spmd.R, TP: spmd.I})},
-        out_src_shardings=SpmdType({DP: spmd.V, TP: spmd.I}),
-        out_dst_shardings=SpmdType({DP: spmd.V, TP: spmd.R}),
+        state_shardings={"pos_embed": SpmdType({DP: spmd.R, CP: spmd.R, TP: spmd.I})},
+        out_src_shardings=SpmdType({DP: spmd.V, CP: spmd.R, TP: spmd.I}),
+        out_dst_shardings=SpmdType({DP: spmd.V, CP: spmd.R, TP: spmd.R}),
     )
     ve_cfg.rotary_pos_emb.sharding_config = ShardingConfig(
-        state_shardings={"inv_freq": SpmdType({DP: spmd.R, TP: spmd.I})},
-        out_src_shardings=SpmdType({DP: spmd.R, TP: spmd.I}),
+        state_shardings={"inv_freq": SpmdType({DP: spmd.R, CP: spmd.R, TP: spmd.I})},
+        out_src_shardings=SpmdType({DP: spmd.R, CP: spmd.R, TP: spmd.I}),
     )
 
-    ve_cfg.patch_embed_proj.sharding_config = vision_invariant_linear_config()
+    ve_cfg.patch_embed_proj.sharding_config = vision_invariant_linear_config(cp=spmd.R)
     set_vision_transformer_block_sharding_config(
         ve_cfg.block,
         rope_cache_dp=spmd.V,
+        cp=spmd.R,
     )
 
     # Merger sub-modules
     merger = ve_cfg.merger
-    merger.norm.sharding_config = invariant_norm_config()
-    merger.fc1.sharding_config = vision_colwise_config()
-    merger.fc2.sharding_config = vision_scaled_bias_rowwise_config()
+    merger.norm.sharding_config = invariant_norm_config(cp=spmd.R)
+    merger.fc1.sharding_config = vision_colwise_config(cp=spmd.R)
+    merger.fc2.sharding_config = vision_scaled_bias_rowwise_config(cp=spmd.R)
 
 
 def _set_full_attention_sharding(
@@ -334,6 +347,13 @@ def _set_deltanet_sharding(
     projected_placement = dense_activation_placement(tp=spmd.S(1), cp=spmd.S(0))
     head_placement = attention_activation_placement()
     parameter_placement = dense_param_placement(tp=spmd.S(0))
+    parameter_grad_placement = SpmdType(
+        {
+            DP: spmd.R,
+            CP: spmd.P,
+            TP: spmd.S(0),
+        }
+    )
     replicated_placement = dense_param_placement(tp=spmd.R)
     cu_seqlens_placement = SpmdType(
         {
@@ -390,19 +410,20 @@ def _set_deltanet_sharding(
         out_src_shardings=head_placement,
         out_dst_shardings=head_placement,
         local_map=LocalMapConfig(
-            # cu_seqlens varies across DP ranks and is replicated across TP.
-            # It has no gradient, but local_map still requires its placement.
+            # Parameter gradients are partial over CP because each rank sees a
+            # different token shard. cu_seqlens has no gradient, but local_map
+            # still requires its placement.
             in_grad_placements=(
                 projected_placement,
                 projected_placement,
                 projected_placement,
                 projected_placement,
                 projected_placement,
-                parameter_placement,
-                parameter_placement,
-                parameter_placement,
-                parameter_placement,
-                parameter_placement,
+                parameter_grad_placement,
+                parameter_grad_placement,
+                parameter_grad_placement,
+                parameter_grad_placement,
+                parameter_grad_placement,
                 cu_seqlens_placement,
             ),
         ),

@@ -12,7 +12,9 @@ from typing import Literal
 import spmd_types as spmd
 import torch
 import torch.nn.functional as F
+from fla.modules.conv.cp import CausalConv1dFunctionCP
 from fla.modules.conv.triton.ops import CausalConv1dFunction
+from fla.ops.cp import FLACPContext
 from fla.ops.gated_delta_rule import (
     chunk_gated_delta_rule as _fla_chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule as _fla_fused_recurrent_gated_delta_rule,
@@ -37,6 +39,7 @@ GatedDeltaBackend = Literal["fla_chunked", "fla_fused_recurrent"]
 spmd.register_local_autograd_function(ChunkGatedDeltaRuleFunction)
 spmd.register_local_autograd_function(FusedRecurrentFunction)
 spmd.register_local_autograd_function(CausalConv1dFunction)
+spmd.register_local_autograd_function(CausalConv1dFunctionCP)
 
 
 @spmd.local_map(
@@ -75,6 +78,25 @@ def _causal_conv1d_varlen(
         backend="triton",
         cu_seqlens=cu_seqlens,
         cu_seqlens_cpu=cu_seqlens_cpu,
+    )
+    return out_BTD.squeeze(0)
+
+
+def _causal_conv1d_cp(
+    x_TD: torch.Tensor,
+    weight: torch.Tensor,
+    cp_context: FLACPContext,
+) -> torch.Tensor:
+    """FLA depthwise causal conv over a context-parallel token shard."""
+    from fla.modules.conv.causal_conv1d import causal_conv1d as _fla_causal_conv1d
+
+    out_BTD, _ = _fla_causal_conv1d(
+        x=x_TD.unsqueeze(0),
+        weight=weight.squeeze(1),
+        bias=None,
+        activation="silu",
+        backend="triton",
+        cp_context=cp_context,
     )
     return out_BTD.squeeze(0)
 
@@ -268,6 +290,7 @@ class GatedDeltaKernel(Module):
         *,
         cu_seqlens: torch.Tensor | None = None,
         cu_seqlens_cpu: torch.Tensor | None = None,
+        cp_context: FLACPContext | None = None,
     ) -> torch.Tensor:
         # Expand Q/K heads to match V when n_value_heads > n_key_heads
         if xq_THK.shape[1] != xv_THV.shape[1]:
@@ -281,6 +304,18 @@ class GatedDeltaKernel(Module):
         xv_BTHV = xv_THV.unsqueeze(0)
         g_BTH = g_TH.unsqueeze(0)
         beta_BTH = beta_TH.unsqueeze(0)
+
+        if cp_context is not None and self.backend != "fla_chunked":
+            raise ValueError(
+                "Gated DeltaNet context parallelism requires the fla_chunked "
+                "backend."
+            )
+
+        if is_in_batch_invariant_mode() and cp_context is not None:
+            raise ValueError(
+                "Gated DeltaNet context parallelism is not supported in "
+                "batch-invariant recurrent mode."
+            )
 
         if is_in_batch_invariant_mode() and cu_seqlens is not None:
             if cu_seqlens_cpu is None:
@@ -298,7 +333,7 @@ class GatedDeltaKernel(Module):
             ).squeeze(0)
 
         if self.backend == "fla_chunked":
-            if cu_seqlens is not None and cu_seqlens_cpu is None:
+            if cp_context is None and cu_seqlens is not None and cu_seqlens_cpu is None:
                 raise ValueError(
                     "Qwen3.5 FLA varlen DeltaNet requires a CPU cu_seqlens tensor."
                 )
@@ -309,8 +344,9 @@ class GatedDeltaKernel(Module):
                 g_BTH,
                 beta_BTH,
                 use_qk_l2norm_in_kernel=True,
-                cu_seqlens=cu_seqlens,
-                cu_seqlens_cpu=cu_seqlens_cpu,
+                cu_seqlens=None if cp_context is not None else cu_seqlens,
+                cu_seqlens_cpu=(None if cp_context is not None else cu_seqlens_cpu),
+                cp_context=cp_context,
             )
         elif self.backend == "fla_fused_recurrent":
             result = _fla_fused_recurrent_gated_delta_rule(
@@ -365,6 +401,7 @@ class InnerGatedDeltaNet(Module):
         key_head_dim: int,
         value_head_dim: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
+        cp_context: FLACPContext | None = None,
     ) -> torch.Tensor:
         """Run separate Q/K/V convolutions and recurrence on local heads."""
         num_tokens = query_TC.shape[0]
@@ -382,6 +419,9 @@ class InnerGatedDeltaNet(Module):
             x_TC: torch.Tensor,
             weight_C1W: torch.Tensor,
         ) -> torch.Tensor:
+            if cp_context is not None:
+                return _causal_conv1d_cp(x_TC, weight_C1W, cp_context)
+
             if cu_seqlens_host is not None:
                 return _causal_conv1d_varlen(
                     x_TC,
@@ -426,6 +466,7 @@ class InnerGatedDeltaNet(Module):
             beta_TH,
             cu_seqlens=cu_seqlens if cu_seqlens_host is not None else None,
             cu_seqlens_cpu=cu_seqlens_cpu,
+            cp_context=cp_context,
         )
 
 
@@ -490,21 +531,29 @@ class GatedDeltaNet(Module):
         self,
         x_TD: torch.Tensor,
         attention_masks: VarlenMetadata | None = None,
+        *,
+        cp_context: FLACPContext | None = None,
     ) -> torch.Tensor:
         num_tokens = x_TD.shape[0]
         cu_seqlens_host = None
         if attention_masks is not None:
-            # FLA caches varlen index helpers by tensor identity. A fresh
-            # tensor ensures forward and activation-checkpoint recompute both
-            # execute the helpers instead of taking different cache paths.
-            with spmd.local():
-                cu_seqlens = attention_masks.cu_seq_q.clone()
-            cu_seqlens_host = attention_masks.cu_seq_q_host
-            if cu_seqlens_host is None:
-                raise ValueError(
-                    "Qwen3.5 GatedDeltaNet varlen requires CPU cu_seqlens "
-                    "metadata. Build VarlenMetadata with include_host_offsets=True."
-                )
+            if cp_context is not None:
+                # FLA CP carries the rank-local offsets; this replicated tensor
+                # only preserves the InnerGatedDeltaNet local-map contract.
+                cu_seqlens = attention_masks.cu_seq_q
+            else:
+                # FLA caches varlen index helpers by tensor identity. A fresh
+                # tensor ensures forward and activation-checkpoint recompute both
+                # execute the helpers instead of taking different cache paths.
+                with spmd.local():
+                    cu_seqlens = attention_masks.cu_seq_q.clone()
+                cu_seqlens_host = attention_masks.cu_seq_q_host
+                if cu_seqlens_host is None:
+                    raise ValueError(
+                        "Qwen3.5 GatedDeltaNet varlen requires CPU cu_seqlens "
+                        "metadata. Build VarlenMetadata with "
+                        "include_host_offsets=True."
+                    )
         else:
             cu_seqlens = torch.arange(
                 0,
@@ -538,6 +587,7 @@ class GatedDeltaNet(Module):
             key_head_dim=self.key_head_dim,
             value_head_dim=self.value_head_dim,
             cu_seqlens_host=cu_seqlens_host,
+            cp_context=cp_context,
         )
         gate_THV = gate_TC.view(num_tokens, -1, self.value_head_dim)
         output_THV = self.norm(output_THV, gate_THV)

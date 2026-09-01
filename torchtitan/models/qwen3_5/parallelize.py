@@ -56,13 +56,6 @@ def parallelize_qwen3_5(
         compile_config.enable and "model" in compile_config.components
     )
 
-    if parallel_dims.cp_enabled:
-        raise NotImplementedError(
-            "Context Parallel is not yet supported for Qwen3.5. "
-            "GatedDeltaNet (75% of layers) requires full-sequence allgather, "
-            "and multimodal CP needs vision scatter before CP sharding."
-        )
-
     if (
         parallelism.spmd_backend == "spmd_types"
         or parallel_dims.tp_enabled
