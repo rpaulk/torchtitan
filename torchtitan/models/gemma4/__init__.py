@@ -210,9 +210,68 @@ def _12b(
     )
 
 
+def _31b(
+    attn_backend: str, tp_gemm_backend: TpGemmBackend = "default"
+) -> Gemma4Model.Config:
+    """Gemma-4 31B configuration.
+    
+    Specifications:
+    - Hidden dimension: 5120
+    - Attention heads: 40
+    - KV heads: 10 (4:1 grouped-query attention)
+    - Layers: 56
+    - Vocabulary size: 262144
+    - Context length: 256K tokens
+    - Sliding window: 4096 tokens
+    """
+    dim = 5120
+    n_heads = 40
+    n_kv_heads = 10
+    n_layers = 56
+    vocab_size = 262144
+
+    return Gemma4Model.Config(
+        dim=dim,
+        vocab_size=vocab_size,
+        sliding_window_size=4096,
+        enable_sliding_window=True,
+        tok_embeddings=Embedding.Config(
+            num_embeddings=vocab_size,
+            embedding_dim=dim,
+            param_init=_EMBEDDING_INIT,
+        ),
+        norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
+        lm_head=Linear.Config(
+            in_features=dim,
+            out_features=vocab_size,
+            param_init=_output_linear_init(dim),
+        ),
+        layers=_build_gemma4_layers(
+            fuse_qkv=True,
+            n_layers=n_layers,
+            dim=dim,
+            n_heads=n_heads,
+            n_kv_heads=n_kv_heads,
+            hidden_dim=compute_ffn_hidden_dim(dim, multiple_of=256),
+            rope=ComplexRoPE.Config(
+                dim=dim // n_heads,
+                max_context_length=256000,
+                theta=500000,
+                scaling="none",
+            ),
+            attn_backend=attn_backend,
+            tp_gemm_backend=tp_gemm_backend,
+            sliding_window_size=4096,
+        ),
+    )
+
+
 gemma4_configs = {
     "debugmodel": _debugmodel,
     "12b": _12b,
+    "12B": _12b,
+    "31b": _31b,
+    "31B": _31b,
 }
 
 
