@@ -147,7 +147,7 @@ def _debugmodel(
                 dim=dim // n_heads,
                 max_context_length=256000,
                 theta=500000,
-                scaling="linear",  # Gemma-4 uses linear scaling
+                scaling="none",
             ),
             attn_backend=attn_backend,
             tp_gemm_backend=tp_gemm_backend,
@@ -201,7 +201,7 @@ def _12b(
                 dim=dim // n_heads,
                 max_context_length=256000,
                 theta=500000,
-                scaling="linear",  # Gemma-4 uses linear RoPE scaling
+                scaling="none",
             ),
             attn_backend=attn_backend,
             tp_gemm_backend=tp_gemm_backend,
