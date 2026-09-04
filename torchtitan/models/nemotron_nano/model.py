@@ -14,6 +14,7 @@ from torch import nn
 
 from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
+from torchtitan.models.common import Linear
 from torchtitan.models.utils import (
     get_nparams_and_active_nparams,
 )
@@ -43,12 +44,14 @@ class NemotronTransformerBlock(TransformerBlock):
         is_mamba_block: bool = False
         # For Mamba blocks: state dimension
         mamba_state_dim: int = 16
-        # For Mamba blocks: hidden dimension for convolution
         mamba_conv_dim: int = 4096
+        mamba_input_projection: Linear.Config | None = None
+        mamba_output_projection: Linear.Config | None = None
 
     def __init__(self, config: Config):
         super().__init__()
         self.is_mamba_block = config.is_mamba_block
+        self.moe_enabled = not self.is_mamba_block and config.moe is not None
         self.mamba_state_dim = config.mamba_state_dim
         
         if self.is_mamba_block:
@@ -57,9 +60,8 @@ class NemotronTransformerBlock(TransformerBlock):
             # For now, we model it as a simplified linear state transition
             self.norm = config.attention_norm.build()
             # Simplified Mamba-like component
-            self.input_projection = nn.Linear(config.attention.dim, config.mamba_conv_dim)
-            self.state_matrix = nn.Parameter(torch.randn(config.mamba_conv_dim, config.mamba_state_dim))
-            self.output_projection = nn.Linear(config.mamba_conv_dim, config.attention.dim)
+            self.input_projection = config.mamba_input_projection.build()
+            self.output_projection = config.mamba_output_projection.build()
         else:
             # Transformer block: attention + FFN
             self.attention = config.attention.build()
@@ -81,11 +83,10 @@ class NemotronTransformerBlock(TransformerBlock):
         positions: torch.Tensor | None = None,
     ):
         if self.is_mamba_block:
+            import torch.nn.functional as F
             # Mamba block forward: norm -> linear proj -> state transition -> output proj
             x_norm = self.norm(x)
-            h = torch.silu(self.input_projection(x_norm))
-            # Simplified state space transition (in real implementation, uses S6 selective scan)
-            state = torch.matmul(h, self.state_matrix)  # (T, D) x (D, S) -> (T, S)
+            h = F.silu(self.input_projection(x_norm))
             h_out = self.output_projection(h)  # Simplified for now
             return x + h_out
         else:
@@ -99,7 +100,8 @@ class NemotronTransformerBlock(TransformerBlock):
             
             return out
 
-
+    def reset_parameters(self) -> None:
+        pass
 class Nemotron3NanoModel(Decoder):
     """
     Nemotron-3 Nano: Hybrid Mamba-Transformer Mixture-of-Experts model.

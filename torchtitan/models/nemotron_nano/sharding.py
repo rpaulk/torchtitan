@@ -18,7 +18,18 @@ from torchtitan.models.common.decoder_sharding import (
     set_dense_ffn_sharding,
     set_gqa_attention_sharding,
     set_gqa_inner_attention_local_map,
+    colwise_config,
+    rowwise_config,
+    dense_param_placement,
 )
+from torchtitan.protocols.sharding import ShardingConfig
+from torchtitan.models.common.moe_sharding import set_moe_sharding_config
+
+_GROUPED_EXPERTS_PARAM_LAYOUT: dict[str, spmd.PerMeshAxisSpmdType] = {
+    "w1_EFD": spmd.S(1),
+    "w2_EDF": spmd.S(2),
+    "w3_EFD": spmd.S(1),
+}
 
 if TYPE_CHECKING:
     from torchtitan.models.nemotron_nano.model import (
@@ -67,8 +78,20 @@ def _set_nemotron_layer_sharding(
     norm = norm_config(enable_sp=enable_sp)
     
     if layer_cfg.is_mamba_block:
-        # Mamba block sharding: norm only
+        # Mamba block sharding: norm + mamba projections + state_matrix
         layer_cfg.attention_norm.sharding_config = norm
+        if hasattr(layer_cfg, 'mamba_input_projection') and layer_cfg.mamba_input_projection is not None:
+            mamba_in_cfg = colwise_config()
+            mamba_x_layout = (
+                dense_sequence_parallel_placement()
+                if enable_sp
+                else dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
+            )
+            mamba_in_cfg.in_src_shardings = {"input": mamba_x_layout}
+            mamba_in_cfg.in_dst_shardings = {"input": dense_activation_placement(tp=spmd.R, cp=spmd.S(0))}
+            layer_cfg.mamba_input_projection.sharding_config = mamba_in_cfg
+        if hasattr(layer_cfg, 'mamba_output_projection') and layer_cfg.mamba_output_projection is not None:
+            layer_cfg.mamba_output_projection.sharding_config = rowwise_config(output_sp=enable_sp)
     else:
         # Transformer block sharding: attention + FFN/MoE
         layer_cfg.attention_norm.sharding_config = norm
@@ -91,4 +114,12 @@ def _set_nemotron_layer_sharding(
                 layer_cfg.feed_forward,
                 attn_x_layout=attn_x_layout,
                 enable_sp=enable_sp,
+            )
+            
+        if hasattr(layer_cfg, 'moe') and layer_cfg.moe is not None:
+            set_moe_sharding_config(
+                layer_cfg.moe,
+                enable_ep=enable_ep,
+                enable_sp=enable_sp,
+                expert_param_layout=_GROUPED_EXPERTS_PARAM_LAYOUT,
             )

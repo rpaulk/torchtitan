@@ -13,6 +13,7 @@ _supported_models = frozenset(
         "kimi_k3",
         "llama3",
         "muse_glimmer",
+        "nemotron_nano",
         "qwen3",
         "qwen3_5",
     ]
