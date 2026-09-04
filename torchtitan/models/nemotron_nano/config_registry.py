@@ -85,7 +85,7 @@ def nemotron_31b() -> Trainer.Config:
             disable_cuda_graphs=True,
         ),
         dataloader=GrainDataLoader.Config(
-            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4"]),
         ),
         parallelism=ParallelismConfig(
             tensor_parallel_degree=2,
