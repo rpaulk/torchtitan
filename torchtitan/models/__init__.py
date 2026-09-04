@@ -7,6 +7,7 @@
 _supported_models = frozenset(
     [
         "deepseek_v3",
+        "deepseek_v4",
         "flux",
         "gpt_oss",
         "kimi_k2_7",
@@ -16,6 +17,7 @@ _supported_models = frozenset(
         "nemotron_nano",
         "qwen3",
         "qwen3_5",
-        "gemma4"
+        "gemma4",
+        "qwen3_8",
     ]
 )

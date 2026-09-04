@@ -9,7 +9,6 @@ from __future__ import annotations
 import enum
 import os
 import queue
-import re
 import threading
 import time
 from concurrent.futures import Future
@@ -216,6 +215,9 @@ class CheckpointManager(BaseCheckpointManager):
 
         # Retention Policy (Purge)
         self.keep_latest_k = config.keep_latest_k
+        self.purge_exempt = (
+            config.purge_exempt.build() if config.purge_exempt is not None else None
+        )
         self.purge_thread: threading.Thread | None = None
         if self.keep_latest_k > 0:
             self.purge_queue: queue.Queue[str | None] = queue.Queue()
@@ -425,6 +427,7 @@ class CheckpointManager(BaseCheckpointManager):
         sl.add_step_tag("checkpoint_save")
 
         self.maybe_wait_for_saving()
+        self._purge_stale_checkpoints(saving_step=curr_step)
 
         begin = time.monotonic()
         checkpoint_phase = (
@@ -484,8 +487,6 @@ class CheckpointManager(BaseCheckpointManager):
                 async_mode=AsyncMode.DISABLED,
                 enable_garbage_collection=True,
             )
-
-        self._purge_stale_checkpoints()
 
         logger.info(
             f"Finished {checkpoint_phase} the checkpoint in "
@@ -662,60 +663,12 @@ class CheckpointManager(BaseCheckpointManager):
         self.save_future.result()
         self.save_future = None
 
-    def _parse_step(self, checkpoint_name: str) -> int | None:
-        match = re.fullmatch(r"step-(0|[1-9]\d*)", checkpoint_name)
-        return int(match.group(1)) if match else None
-
-    def _has_complete_metadata(self, checkpoint_id: str) -> bool:
-        return self._storage.isfile(filesystem.join(checkpoint_id, ".metadata")) or (
+    def _is_valid_checkpoint(self, checkpoint_dir: str) -> bool:
+        return self._storage.isfile(filesystem.join(checkpoint_dir, ".metadata")) or (
             self._storage.isfile(
-                filesystem.join(checkpoint_id, "model.safetensors.index.json")
+                filesystem.join(checkpoint_dir, "model.safetensors.index.json")
             )
         )
-
-    def _find_load_step(self, folder: str = "") -> int:
-        """Identify the highest available checkpoint step in the specified directory.
-
-        This method scans the target folder for subdirectories matching the
-        'step-N' pattern. A folder is only considered a valid checkpoint if
-        it contains either a DCP metadata file or a HuggingFace safetensors
-        index.
-
-        Args:
-            folder (str, optional): The directory to scan. Defaults to `self.folder`.
-
-        Returns:
-            int: The maximum step number found among valid checkpoints,
-                or -1 if no valid checkpoints are detected.
-
-        Note:
-            This function is not remote friendly: it issues one listdir plus
-            up to two isfile probes per step folder, each a network round trip
-            on remote (fsspec) storage instead of a single batched listing.
-            Acceptable for now since it only runs once at load time.
-        """
-
-        folder = folder or self.folder
-        if not self._storage.isdir(folder):
-            return -1
-
-        valid_steps = []
-
-        for filename in self._storage.listdir(folder):
-            checkpoint_path = filesystem.join(folder, filename)
-            if (
-                self._has_complete_metadata(checkpoint_path)
-                and (step := self._parse_step(filename)) is not None
-            ):
-                valid_steps.append(step)
-
-        return max(valid_steps) if valid_steps else -1
-
-    def _create_checkpoint_id(self, step: int, folder: str = "") -> str:
-        """Generate the standardized filesystem path for a checkpoint
-        (e.g., 'checkpoints/step-100')."""
-        folder = folder or self.folder
-        return filesystem.join(folder, f"step-{step}")
 
     def _flattened_model_states_sd(
         self, state_dict: dict[str, Any] | None = None
@@ -818,41 +771,3 @@ class CheckpointManager(BaseCheckpointManager):
             enable_garbage_collection=True,
             to_hf=self.last_save_in_hf,
         )
-
-    def _should_save(self, curr_step: int, last_step: bool = False) -> bool:
-        """Determine whether a checkpoint should be saved based on
-        the current step, interval, and training status."""
-
-        if not self.enable or self.load_only:
-            return False
-
-        if curr_step == 1 and self.enable_first_step_checkpoint:
-            return True
-
-        if last_step:
-            return True
-
-        if curr_step % self.interval == 0:
-            return True
-
-        return False
-
-    def _purge_stale_checkpoints(self):
-        """Remove older checkpoint directories from storage to maintain
-        only the most recent 'k' copies."""
-        if self._should_purge():
-            discovered_checkpoints = []
-            for filename in self._storage.listdir(self.folder):
-                path = filesystem.join(self.folder, filename)
-                if (
-                    self._has_complete_metadata(path)
-                    and (step := self._parse_step(filename)) is not None
-                ):
-                    discovered_checkpoints.append((step, path))
-
-            discovered_checkpoints.sort()
-            to_delete = discovered_checkpoints[: -1 * self.keep_latest_k]
-
-            for _, path in to_delete:
-                assert self.purge_thread is not None
-                self.purge_queue.put(path)

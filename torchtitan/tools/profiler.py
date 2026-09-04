@@ -6,19 +6,26 @@
 
 """Kineto profiler + memory-snapshot lifecycle."""
 
+import inspect
 import os
 import pickle
 import time
 from dataclasses import dataclass
-from typing import Annotated
 
 import torch
-import tyro
 from torchtitan.config import Configurable
-from torchtitan.config.function import Function
+from torchtitan.distributed.cudagraph import get_cudagraph_annotations
 from torchtitan.observability import structured_logger as sl
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import device_module
+
+# torch's export_chrome_trace gained cuda_graph_annotations when the offline joiner
+# (torch.cuda._annotate_cuda_graph_trace) was removed. Older versions still export, just
+# without the CUDA graph annotations baked in.
+_EXPORT_SUPPORTS_ANNOTATIONS = (
+    "cuda_graph_annotations"
+    in inspect.signature(torch.profiler.profile.export_chrome_trace).parameters
+)
 
 # Paths expects by meta internal tooling
 PROFILE_DIR = "profiling/traces"  # Profiler.Config.save_traces_folder default
@@ -183,15 +190,6 @@ class Profiler(Configurable):
         are dropped once full. Bounds host memory and snapshot size / dump time.
         """
 
-        trace_post_processor: Annotated[
-            Function.Config | None, tyro.conf.Suppress
-        ] = None
-        """Optional hook invoked with the trace path after each export.
-
-        Wraps ``fn(trace_path: str) -> None``.
-        Set programmatically (not via CLI) — tyro cannot parse Callable types.
-        """
-
         def __post_init__(self) -> None:
             if self.enable_profiling and self.profile_freq < (
                 self.profiler_warmup + self.profiler_active
@@ -295,9 +293,6 @@ class Profiler(Configurable):
         )
 
         rank = torch.distributed.get_rank()
-        post_processor = (
-            cfg.trace_post_processor.build() if cfg.trace_post_processor else None
-        )
 
         def trace_handler(prof):
             curr_trace_dir_name = PROFILE_ITER_DIR.format(step=prof.step_num)
@@ -309,10 +304,19 @@ class Profiler(Configurable):
             begin = time.monotonic()
 
             output_file = os.path.join(curr_trace_dir, PROFILE_FILE.format(rank=rank))
-            prof.export_chrome_trace(output_file)
-
-            if post_processor is not None:
-                post_processor(output_file)
+            # CUDA graph annotations are baked in during the export rather than
+            # joined onto the written file afterwards: re-reading and rewriting a
+            # gzipped trace paid the compression cost twice.
+            annotations = get_cudagraph_annotations()
+            if annotations and not _EXPORT_SUPPORTS_ANNOTATIONS:
+                logger.warning(
+                    "This torch does not support cuda_graph_annotations on "
+                    "export_chrome_trace; the trace will have no CUDA graph kernel "
+                    "annotations."
+                )
+                annotations = None
+            extra = {"cuda_graph_annotations": annotations} if annotations else {}
+            prof.export_chrome_trace(output_file, **extra)
 
             logger.info(
                 f"Finished dumping profiler traces in {time.monotonic() - begin:.2f} seconds"

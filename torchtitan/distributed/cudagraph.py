@@ -4,10 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Lightweight CUDA graph wrapper for eager-mode training steps.
-
-Adapted from ``torchtitan/experiments/graph_trainer/cudagraph.py``.
-"""
+"""Lightweight CUDA graph wrapper for training steps."""
 
 import warnings
 from collections.abc import Callable, Sequence
@@ -15,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
+from torch.cuda._graph_annotations import get_kernel_annotations
 from torch.nn.attention.flex_attention import BlockMask
 from torch.utils import _pytree as pytree
 
@@ -123,7 +121,7 @@ class CUDAGraphInputSpec:
 
 
 class _CUDAGraphManager:
-    """Singleton that owns a shared graph pool and stream."""
+    """Singleton that owns a shared graph pool, stream, and annotations."""
 
     def __init__(self) -> None:
         self._initialized = False
@@ -131,6 +129,7 @@ class _CUDAGraphManager:
         self._graph_pool: Any = None
         self._stream: torch.cuda.Stream | None = None
         self._dummy_graph: torch.cuda.CUDAGraph | None = None
+        self.all_annotations: dict[int, list[Any]] = {}
 
     @property
     def graph_pool(self) -> Any:
@@ -186,6 +185,11 @@ def cudagraph_teardown() -> None:
     _manager.teardown()
 
 
+def get_cudagraph_annotations() -> dict[int, list[Any]]:
+    """Return all kernel annotations accumulated across CUDA graph captures."""
+    return _manager.all_annotations
+
+
 class CUDAGraphWrapper:
     """Wrap a callable with CUDA graph capture and replay.
 
@@ -197,14 +201,17 @@ class CUDAGraphWrapper:
             are stable across calls (e.g. model weights/buffers).
         should_check_address: Whether to verify static input tensor addresses
             before each replay. This should only be enabled for debugging.
+        tensor_input_indices: Indices of inputs that should be copied before
+            replay. When omitted, these are inferred from ``example_inputs``.
     """
 
     def __init__(
         self,
         fn: Callable,
         example_inputs: Sequence[Any],
-        static_input_indices: tuple[int, ...] | None = None,
+        static_input_indices: Sequence[int] | None = None,
         should_check_address: bool = False,
+        tensor_input_indices: Sequence[int] | None = None,
     ):
         self._fn = fn
         self._num_inputs = len(example_inputs)
@@ -218,11 +225,16 @@ class CUDAGraphWrapper:
                 f"{sorted(invalid_static_indices)}"
             )
 
-        self._input_indices_to_copy = [
-            i
-            for i, inp in enumerate(example_inputs)
-            if isinstance(inp, torch.Tensor) and i not in self._static_input_indices
-        ]
+        if tensor_input_indices is not None:
+            self._input_indices_to_copy = [
+                i for i in tensor_input_indices if i not in self._static_input_indices
+            ]
+        else:
+            self._input_indices_to_copy = [
+                i
+                for i, inp in enumerate(example_inputs)
+                if isinstance(inp, torch.Tensor) and i not in self._static_input_indices
+            ]
         self._tensor_metadata = {
             i: (inp.shape, inp.dtype, inp.device)
             for i, inp in enumerate(example_inputs)
@@ -309,9 +321,11 @@ class CUDAGraphWrapper:
                 self._graph,
                 pool=_manager.graph_pool,
                 stream=_manager.stream,
+                enable_annotations=True,
                 capture_error_mode="thread_local",
             ):
                 self._output = self._fn(*args)
+            _manager.all_annotations.update(get_kernel_annotations())
             logger.info("Recorded CUDA graph")
 
         if self._should_check_address:
