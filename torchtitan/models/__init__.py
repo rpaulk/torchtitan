@@ -19,5 +19,6 @@ _supported_models = frozenset(
         "qwen3_5",
         "gemma4",
         "qwen3_8",
+        "gemma4",
     ]
 )
