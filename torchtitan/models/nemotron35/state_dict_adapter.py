@@ -13,12 +13,17 @@ import re
 from typing import Any
 
 import torch
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import distribute_tensor, DTensor
 
 from torchtitan.models.utils import MoEStateDictAdapter
-from torchtitan.tools.logging import logger
+import logging
 
-from .model import Nemotron35Model
+from typing import TYPE_CHECKING
+
+logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .model import Nemotron35Model
 
 __all__ = ["NemotronStateDictAdapter"]
 
@@ -73,22 +78,23 @@ _TT_LAYER_RE = re.compile(r"^layers\.(\d+)\.(.+)$")
 
 # HF mixer suffix -> torchtitan per-layer suffix, for Mamba blocks.
 _MAMBA_SUFFIX_MAP = {
-    "mixer.in_proj.weight": "in_proj.weight",
-    "mixer.conv1d.weight": "conv1d.weight",
-    "mixer.conv1d.bias": "conv1d.bias",
-    "mixer.dt_bias": "dt_bias",
-    "mixer.A_log": "A_log",
-    "mixer.D": "D",
-    "mixer.norm.weight": "mamba_norm.weight",
-    "mixer.out_proj.weight": "out_proj.weight",
+    "mixer.in_proj.weight": "mamba.in_proj.weight",
+    "mixer.conv1d.weight": "mamba.conv1d.weight",
+    "mixer.conv1d.bias": "mamba.conv1d.bias",
+    "mixer.dt_bias": "mamba.dt_bias",
+    "mixer.A_log": "mamba.A_log",
+    "mixer.D": "mamba.D",
+    "mixer.norm.weight": "mamba.norm.weight",
+    "mixer.out_proj.weight": "mamba.out_proj.weight",
 }
 
-# Per-layer input norm, by layer kind.
+# Per-layer input norm. Every NemotronBlock owns a single ``norm`` regardless
+# of its mixer kind, mirroring HF's ``backbone.layers.{N}.norm``.
 _NORM_SUFFIX_BY_KIND = {
     "mamba": "norm.weight",
-    "attention": "attention_norm.weight",
-    "mlp": "ffn_norm.weight",
-    "moe": "ffn_norm.weight",
+    "attention": "norm.weight",
+    "mlp": "norm.weight",
+    "moe": "norm.weight",
 }
 
 # HF attention projections that participate in the fused QKV buffer.
@@ -118,12 +124,12 @@ _MOE_SHARED_SUFFIX_MAP = {
 _HF_EXPERT_RE = re.compile(r"^mixer\.experts\.(\d+)\.(up_proj|down_proj)\.weight$")
 
 # HF per-expert projection -> the torchtitan STACKED parameter it lands in.
-#   up_proj   [F, D] -> w1_EFD [E, F, D]
-#   down_proj [D, F] -> w2_EDF [E, D, F]
+#   up_proj   [F, D] -> w13.weight [E, F, D]  (num_linears=1: ungated, no gate)
+#   down_proj [D, F] -> w2.weight  [E, D, F]
 # Stacking is along dim 0 at the expert's own index; no transpose is involved.
 _MOE_EXPERT_STACK_SUFFIX = {
-    "up_proj": "moe.routed_experts.inner_experts.w1_EFD",
-    "down_proj": "moe.routed_experts.inner_experts.w2_EDF",
+    "up_proj": "moe.routed_experts.w13.weight",
+    "down_proj": "moe.routed_experts.w2.weight",
 }
 
 _QKV_HF_SUFFIXES = {
@@ -177,41 +183,40 @@ class NemotronStateDictAdapter(MoEStateDictAdapter):
 
     QKV layout
     ----------
-    ``FusedQKVLinear`` registers ``_split_qkv_on_save`` / ``_merge_qkv_on_load``
-    hooks, so its *state dict* is always the stock ``wq``/``wk``/``wv`` layout
-    even though its *parameter* is a single fused ``wqkv``. That fused parameter
-    is interleaved as ``(n_kv_heads, heads_per_kv + 2, head_dim, dim)``, **not**
+    Upstream ``QKVLinear`` holds a single fused ``wqkv`` parameter and has no
+    split/merge state-dict hooks, so the model state dict contains only
+    ``attention.qkv_linear.wqkv.weight``. It is interleaved as
+    ``(n_kv_heads, heads_per_kv + 2, head_dim, dim)``, **not**
     ``cat([q, k, v], dim=0)``.
 
-    So ``from_hf`` emits ``wq``/``wk``/``wv`` by default -- the form a real state
-    dict actually uses, and the form ``_merge_qkv_on_load`` expects. Q, K and V
-    are still buffered until all three of a layer have been seen, and
-    ``emit_fused_qkv=True`` produces a single ``wqkv`` tensor in the correct
-    interleaved layout. ``to_hf`` accepts either form.
+    ``from_hf`` therefore buffers Q, K and V until all three of a layer have
+    been seen and emits the fused ``wqkv`` by default. ``emit_fused_qkv=False``
+    emits split ``wq``/``wk``/``wv`` for callers that want the logical layout.
+    ``to_hf`` accepts either form.
 
     MoE layout
     ----------
     HF stores routed experts as ``num_experts`` separate tensors per layer
     (``mixer.experts.{i}.up_proj.weight``), while torchtitan uses one stacked
-    tensor per projection (``routed_experts.inner_experts.w1_EFD``, shape
+    tensor per projection (``routed_experts.w13.weight``, shape
     ``[E, F, D]``). ``from_hf`` buffers the per-expert tensors keyed by the
     expert index *parsed from the key* and stacks them only once all ``E`` have
     arrived, so the result does not depend on shard or dict ordering; an
     incomplete set at the end of a call is a ``ValueError`` naming the layer and
     the missing indices. ``to_hf`` unbinds dim 0 back into per-expert keys.
 
-    The experts are UNGATED (``down(relu(up(x))**2)``) -- there is no ``w3_EFD``
-    and no HF ``gate_proj``. The router's ``e_score_correction_bias`` maps to the
+    The experts are UNGATED (``down(relu(up(x))**2)``) --
+    and no HF ``gate_proj`` (``w13`` has num_linears=1). The router's ``e_score_correction_bias`` maps to the
     persistent ``moe.expert_bias_E`` buffer; ``moe.tokens_per_expert_E`` is a
     torchtitan-only counter (non-persistent) with no HF counterpart.
     """
 
     def __init__(
         self,
-        model_config: Nemotron35Model.Config,
+        model_config: "Nemotron35Model.Config",
         hf_assets_path: str | None,
         *,
-        emit_fused_qkv: bool = False,
+        emit_fused_qkv: bool = True,
     ):
         # The base class builds ``fqn_to_index_mapping`` by regex-matching a
         # shard NUMBER out of each weight_map filename, which assumes the
@@ -231,6 +236,14 @@ class NemotronStateDictAdapter(MoEStateDictAdapter):
         # Partial Q/K/V sets, keyed by layer id. Persisted on the instance so a
         # sharded / multi-call load can complete a layer across calls.
         self._qkv_buffer: dict[int, dict[str, Any]] = {}
+
+        # layer_id -> (mesh, placements) of the live sharded fused wqkv. The
+        # interleaved fuse/split reshapes to (n_kv, R, head_dim, dim); n_kv is
+        # tiny (2) and is generally NOT divisible by the shard count, so doing
+        # that reshape on a DTensor either raises or redistributes rows wrongly.
+        # to_hf therefore splits the full tensor, and from_hf re-shards the
+        # fused result with the recorded layout.
+        self._qkv_dtensor_spec: dict[int, tuple[Any, Any]] = {}
 
         # Partial per-expert sets: layer_id -> proj ("up_proj"/"down_proj") ->
         # {expert_index: tensor}. Experts arrive as `num_experts` separate HF
@@ -299,27 +312,13 @@ class NemotronStateDictAdapter(MoEStateDictAdapter):
 
     def _layer_kind(self, layer_id: int) -> str:
         """One of ``mamba`` | ``attention`` | ``mlp`` | ``moe``."""
-        cfg = self._layer_config(layer_id)
-
-        # Prefer an explicit block_type, but never trust a default "mamba" on a
-        # config whose is_mamba_block says otherwise.
-        block_type = getattr(cfg, "block_type", None)
-        if block_type in _NORM_SUFFIX_BY_KIND:
-            if block_type != "mamba" or getattr(cfg, "is_mamba_block", True):
-                return block_type
-
-        if getattr(cfg, "is_mamba_block", False):
-            return "mamba"
-        if getattr(cfg, "attention", None) is not None:
-            return "attention"
-        if getattr(cfg, "moe", None) is not None:
-            return "moe"
-        if getattr(cfg, "feed_forward", None) is not None:
-            return "mlp"
-        raise ValueError(
-            f"Cannot determine the layer type of layer {layer_id}: its config has "
-            "no block_type, is_mamba_block, attention, moe or feed_forward set."
-        )
+        block_type = getattr(self._layer_config(layer_id), "block_type", None)
+        if block_type not in _NORM_SUFFIX_BY_KIND:
+            raise ValueError(
+                f"Layer {layer_id} has invalid block_type {block_type!r}; expected "
+                f"one of {sorted(_NORM_SUFFIX_BY_KIND)}."
+            )
+        return block_type
 
     def _attention_config(self, layer_id: int | None = None) -> Any:
         """Attention config for ``layer_id``, else the first layer that has one.
@@ -374,23 +373,14 @@ class NemotronStateDictAdapter(MoEStateDictAdapter):
     def _num_experts(self, layer_id: int) -> int:
         """Routed-expert count for a MoE layer, read from the config.
 
-        The stacked ``w1_EFD``/``w2_EDF`` tensors are sized by this, and it is
-        also the completeness criterion for the expert buffer: a layer is only
-        emitted once every index in ``range(num_experts)`` has arrived.
+        The stacked ``w13``/``w2`` tensors are sized by this, and it is also the
+        completeness criterion for the expert buffer: a layer is only emitted
+        once every index in ``range(num_experts)`` has arrived.
         """
         moe = getattr(self._layer_config(layer_id), "moe", None)
-        for holder, attr in (
-            (moe, "num_experts"),
-            (getattr(moe, "routed_experts", None), "num_experts"),
-            (
-                getattr(getattr(moe, "routed_experts", None), "inner_experts", None),
-                "num_experts",
-            ),
-            (self.model_config, "num_experts"),
-        ):
-            count = getattr(holder, attr, None)
-            if isinstance(count, int) and count > 0:
-                return count
+        count = getattr(moe, "num_experts", None)
+        if isinstance(count, int) and count > 0:
+            return count
         raise ValueError(
             f"Layer {layer_id} is a MoE layer but its config does not declare a "
             "positive num_experts; cannot size the stacked expert tensors."
@@ -568,9 +558,18 @@ class NemotronStateDictAdapter(MoEStateDictAdapter):
                 continue
             q, k, v = parts["q"], parts["k"], parts["v"]
             if self.emit_fused_qkv:
-                state_dict[f"layers.{layer_id}.{_TT_QKV_FUSED_SUFFIX}"] = self._fuse_qkv(
-                    q, k, v, layer_id
+                q, k, v = (
+                    t.full_tensor() if isinstance(t, DTensor) else t for t in (q, k, v)
                 )
+                fused = self._fuse_qkv(q, k, v, layer_id)
+                spec = self._qkv_dtensor_spec.pop(layer_id, None)
+                if spec is not None:
+                    # Every rank holds the identical full tensor, so shard it
+                    # locally (src_data_rank=None: no broadcast needed).
+                    fused = distribute_tensor(
+                        fused, spec[0], spec[1], src_data_rank=None
+                    )
+                state_dict[f"layers.{layer_id}.{_TT_QKV_FUSED_SUFFIX}"] = fused
             else:
                 for part, tensor in (("q", q), ("k", k), ("v", v)):
                     suffix = _TT_QKV_SPLIT_SUFFIXES[part]
@@ -748,7 +747,7 @@ class NemotronStateDictAdapter(MoEStateDictAdapter):
             prefix = f"backbone.layers.{layer_id}"
 
             # Every layer's input norm collapses back to the same HF name. Note
-            # `norm.weight` is the Mamba input norm while `mamba_norm.weight` is
+            # `norm.weight` is the block input norm while `mamba.norm.weight` is
             # the gated SSM norm -- they must not be confused.
             if suffix in norm_suffixes and suffix == _NORM_SUFFIX_BY_KIND[kind]:
                 hf_state_dict[f"{prefix}.norm.weight"] = value
@@ -768,6 +767,12 @@ class NemotronStateDictAdapter(MoEStateDictAdapter):
                     hf_state_dict[f"{prefix}.mixer.{part}_proj.weight"] = value
                     continue
                 if suffix == _TT_QKV_FUSED_SUFFIX:
+                    if isinstance(value, DTensor):
+                        self._qkv_dtensor_spec[layer_id] = (
+                            value.device_mesh,
+                            value.placements,
+                        )
+                        value = value.full_tensor()
                     q, k, v = self._split_qkv(value, layer_id)
                     hf_state_dict[f"{prefix}.mixer.q_proj.weight"] = q
                     hf_state_dict[f"{prefix}.mixer.k_proj.weight"] = k

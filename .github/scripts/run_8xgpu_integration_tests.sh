@@ -80,6 +80,7 @@ if ! CUDA_HOME=/usr/local/cuda NCCL_NVLS_ENABLE=0 TORCH_SHOW_CPP_STACKTRACES=1 p
   --execution_mode real_pg \
   --exclude qwen3_fsdp+deepep,deepseek_v3_fsdp+hybridep+compile \
   --gpu_arch_type "${GPU_ARCH_TYPE}" \
+  --gpu_arch h100 \
   --ngpu 8 \
   "${ARTIFACTS}/h100/base"; then
   STATUS=1
@@ -89,6 +90,10 @@ fi
 # export different Python APIs. Install and test each backend sequentially.
 if [[ "${GPU_ARCH_TYPE}" != "rocm" ]]; then
   bash .github/scripts/install_deepep_v2.sh
+  if ! CUDA_HOME=/usr/local/cuda NCCL_NVLS_ENABLE=0 EP_DISABLE_GIN=1 python -m pytest \
+    tests/unit_tests/gpu/test_deepep_activation_checkpoint.py -v; then
+    STATUS=1
+  fi
   if ! CUDA_HOME=/usr/local/cuda NCCL_NVLS_ENABLE=0 EP_DISABLE_GIN=1 TORCH_SHOW_CPP_STACKTRACES=1 python -m tests.integration_tests.run_tests \
     --test_suite h100 \
     --execution_mode real_pg \
