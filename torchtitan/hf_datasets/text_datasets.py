@@ -191,12 +191,94 @@ class ChatProcessor(SampleProcessor):
     ) -> TextSequence | None:
         if not messages or messages[-1]["role"] != "assistant":
             raise ValueError("Chat samples must end with an assistant message.")
+        segments = self._thinking_segments(messages, renderer)
+        if segments is None:
+            return self._render_document(messages, tools=tools, renderer=renderer)
+
+        # One document per user turn, packed into one row. Positions restart at
+        # 0 per document, which packing, attention masks, and Mamba's seq_idx
+        # all treat as a document boundary.
+        documents = []
+        for prefix, trained in segments:
+            document = self._render_document(
+                prefix, tools=tools, renderer=renderer, trained=trained
+            )
+            if document is not None:
+                documents.append(document)
+        if not documents:
+            return None
+        return TextSequence(
+            input_ids=np.concatenate([d.input_ids for d in documents]),
+            labels=np.concatenate([d.labels for d in documents]),
+            positions=np.concatenate(
+                [np.arange(len(d.input_ids), dtype=np.int64) for d in documents]
+            ),
+        )
+
+    @staticmethod
+    def _thinking_segments(
+        messages: list[Message], renderer: Renderer
+    ) -> list[tuple[list[Message], set[int]]] | None:
+        """Split at user turns when the template strips earlier reasoning.
+
+        A template that keeps reasoning only for the current tool cycle renders
+        earlier assistant turns without it, so one render would train those
+        turns without reasoning. Each segment instead renders the history up to
+        one user turn's responses and trains only those responses, which is
+        exactly what the model sees at inference. Returns None when one render
+        is already faithful.
+        """
+        user_indices = [i for i, m in enumerate(messages) if m["role"] == "user"]
+        if len(user_indices) < 2:
+            return None
+        if not any(
+            m["role"] == "assistant" and (m.get("reasoning_content") or m.get("reasoning"))
+            for m in messages[: user_indices[-1]]
+        ):
+            return None
+        retention = getattr(renderer, "effective_thinking_retention", None)
+        if retention is None:
+            raise ValueError(
+                f"{type(renderer).__name__} does not report "
+                "effective_thinking_retention; cannot tell whether multi-turn "
+                "reasoning history must be split."
+            )
+        if retention == "all":
+            return None
+        if retention != "tool_cycle":
+            raise ValueError(f"Unsupported thinking retention {retention!r}.")
+
+        # Shallow copies make message identity unique for role_to_mask.
+        messages = [dict(m) for m in messages]
+        bounds = [*user_indices[1:], len(messages)]
+        segments = []
+        for start, end in zip(user_indices, bounds):
+            while end > start and messages[end - 1]["role"] != "assistant":
+                end -= 1
+            if end > start:
+                segments.append(
+                    (messages[:end], {id(m) for m in messages[start:end]})
+                )
+        return segments
+
+    def _render_document(
+        self,
+        messages: list[Message],
+        *,
+        tools: list[ToolSpec] | None,
+        renderer: Renderer,
+        trained: set[int] | None = None,
+    ) -> TextSequence | None:
         # TODO(data-sft-supervision): Support per-turn loss weighting.
+        kwargs = {}
+        if trained is not None:
+            kwargs["role_to_mask"] = lambda m: id(m) in trained
         rendered = build_training_sample(
             renderer,
             messages,
             tools=tools,
             ensure_final_stop=True,
+            **kwargs,
         )
         if rendered.multi_modal_data is not None:
             raise ValueError("ChatProcessor supports text-only samples.")

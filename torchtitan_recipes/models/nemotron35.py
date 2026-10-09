@@ -66,3 +66,48 @@ def nemotron35_lightning(seq_len: int | None = None) -> Trainer.Config:
         ),
         activation_checkpoint=FullAC.Config(),
     )
+
+
+def nemotron35_lightning_sft_smoke(seq_len: int | None = None) -> Trainer.Config:
+    """Short SFT smoke run on real agentic rows through the per-user-turn split.
+
+    Uses one converted dataset and the Nemotron 3.5 renderer; the full mixed
+    recipe comes later. Packing keeps document boundaries (positions == 0),
+    which attention and Mamba (seq_idx) both respect.
+    """
+    from renderers.configs import Nemotron35RendererConfig
+
+    from torchtitan.components.data import FirstFitPackingConfig
+    from torchtitan.components.data.dataset import SingleDatasetConfig
+    from torchtitan.components.data.sources import IndexedJsonlSource
+    from torchtitan.components.renderer import from_renderers
+    from torchtitan.hf_datasets.text_datasets import ChatProcessor
+
+    config = nemotron35_lightning(seq_len=seq_len or 32768)
+    config.dataloader = GrainDataLoader.Config(
+        dataset=FirstFitPackingConfig(
+            dataset=SingleDatasetConfig(
+                source=IndexedJsonlSource.Config(
+                    patterns=(
+                        "/mnt/powerscale/data/datasets/nemotron35-lightning-sft/"
+                        "converted/agentic_search.jsonl",
+                    )
+                ),
+                processor=ChatProcessor.Config(
+                    messages_fn=lambda row: row["messages"],
+                    tools_fn=lambda row: row.get("tools") or None,
+                    renderer=from_renderers(Nemotron35RendererConfig()),
+                ),
+                post_filters=(lambda sample: sample is not None,),
+            )
+        ),
+    )
+    config.optim.optimizer.optimizers[0].lr = 1e-5
+    config.optim.lr_scheduler.warmup_steps = 2
+    config.training.num_tokens_per_microbatch_per_dp_rank = (
+        config.model.max_context_length
+    )
+    config.training.steps = 10
+    config.checkpointer.interval = 10_000
+    config.dump_folder = "/data/nemotron35_sft_smoke"
+    return config

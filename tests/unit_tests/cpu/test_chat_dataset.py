@@ -355,45 +355,85 @@ class TestMultiTurnChatProcessor(unittest.TestCase):
     def test_assistant_masks_follow_rendered_history(self):
         context = _runtime(256)
         sequence = self.config.build(context=context)({}, np.random.default_rng(0))
-        # Qwen3 drops earlier reasoning but still trains both assistant answers.
-        # The final think opener and both assistant terminators are model output.
-        segments = [
-            ("<|im_start|>system\nBe brief.<|im_end|>\n", False),
-            ("<|im_start|>user\nWhat is 2+2?<|im_end|>\n", False),
-            ("<|im_start|>assistant\n", False),
-            ("4<|im_end|>", True),
-            ("\n<|im_start|>user\nAnd 3+3?<|im_end|>\n", False),
-            ("<|im_start|>assistant\n", False),
-            ("<think>\nAdd three.\n</think>\n\n6<|im_end|>", True),
-            ("\n", False),
+        # Qwen3 strips reasoning from earlier turns, so the sample splits per
+        # user turn: each document trains only its own answer, with reasoning,
+        # exactly as rendered at inference. Earlier answers are masked context.
+        documents = [
+            [
+                ("<|im_start|>system\nBe brief.<|im_end|>\n", False),
+                ("<|im_start|>user\nWhat is 2+2?<|im_end|>\n", False),
+                ("<|im_start|>assistant\n", False),
+                ("<think>\nAdd two.\n</think>\n\n4<|im_end|>", True),
+                ("\n", False),
+            ],
+            [
+                ("<|im_start|>system\nBe brief.<|im_end|>\n", False),
+                ("<|im_start|>user\nWhat is 2+2?<|im_end|>\n", False),
+                ("<|im_start|>assistant\n", False),
+                ("4<|im_end|>", False),
+                ("\n<|im_start|>user\nAnd 3+3?<|im_end|>\n", False),
+                ("<|im_start|>assistant\n", False),
+                ("<think>\nAdd three.\n</think>\n\n6<|im_end|>", True),
+                ("\n", False),
+            ],
         ]
-        expected_tokens = []
-        expected_labels = []
-        for text, supervised in segments:
-            tokens = context.tokenizer.encode(text, add_bos=False, add_eos=False)
-            expected_tokens.extend(tokens)
-            expected_labels.extend(
-                tokens if supervised else [IGNORE_INDEX] * len(tokens)
-            )
+        expected_tokens, expected_labels, expected_positions = [], [], []
+        for segments in documents:
+            tokens, labels = [], []
+            for text, supervised in segments:
+                ids = context.tokenizer.encode(text, add_bos=False, add_eos=False)
+                tokens.extend(ids)
+                labels.extend(ids if supervised else [IGNORE_INDEX] * len(ids))
+            expected_tokens.extend(tokens[:-1])
+            expected_labels.extend(labels[1:])
+            expected_positions.extend(range(len(tokens) - 1))
 
-        np.testing.assert_array_equal(sequence.input_ids, expected_tokens[:-1])
-        np.testing.assert_array_equal(sequence.labels, expected_labels[1:])
+        np.testing.assert_array_equal(sequence.input_ids, expected_tokens)
+        np.testing.assert_array_equal(sequence.labels, expected_labels)
+        np.testing.assert_array_equal(sequence.positions, expected_positions)
+
+    def test_no_split_when_template_keeps_all_reasoning(self):
+        renderer = SimpleNamespace(effective_thinking_retention="all")
+        config = ChatProcessor.Config(
+            messages_fn=lambda _: self.messages,
+            renderer=_FakeRendererConfig(renderer=renderer),
+        )
+        rendered = SimpleNamespace(
+            token_ids=[1, 2, 3], loss_mask=[False, False, True], multi_modal_data=None
+        )
+        with patch(
+            "torchtitan.hf_datasets.text_datasets.build_training_sample",
+            return_value=rendered,
+        ) as build_training_sample:
+            sequence = config.build(context=_runtime(256))({}, np.random.default_rng(0))
+        build_training_sample.assert_called_once()
+        self.assertIsNone(sequence.positions)
+
+    def test_split_requires_renderer_retention(self):
+        config = ChatProcessor.Config(
+            messages_fn=lambda _: self.messages,
+            renderer=_FakeRendererConfig(renderer=object()),
+        )
+        with self.assertRaisesRegex(ValueError, "effective_thinking_retention"):
+            config.build(context=_runtime(256))({}, np.random.default_rng(0))
 
     def test_context_length_counts_next_token_pairs(self):
         sequence = self.config.build(context=_runtime(256))(
             {}, np.random.default_rng(0)
         )
-        length = len(sequence.input_ids)
+        # The limit applies per document; the longest is the last split.
+        length = int(sequence.positions.max()) + 1
         exact = self.config.build(context=_runtime(length))(
             {}, np.random.default_rng(0)
         )
         np.testing.assert_array_equal(exact.input_ids, sequence.input_ids)
         np.testing.assert_array_equal(exact.labels, sequence.labels)
-        self.assertIsNone(
-            self.config.build(context=_runtime(length - 1))(
-                {}, np.random.default_rng(0)
-            )
+        # Too short for the last split: only the first document survives.
+        shorter = self.config.build(context=_runtime(length - 1))(
+            {}, np.random.default_rng(0)
         )
+        first = int(np.flatnonzero(sequence.positions == 0)[1])
+        np.testing.assert_array_equal(shorter.input_ids, sequence.input_ids[:first])
 
     def test_packing_preserves_whole_conversations(self):
         sequence = self.config.build(context=_runtime(256))(
@@ -401,12 +441,12 @@ class TestMultiTurnChatProcessor(unittest.TestCase):
         )
         length = len(sequence.input_ids)
         packed = next(iter(_build_rows(2 * length, processor=self.config)))
-        np.testing.assert_array_equal(packed.positions, np.tile(np.arange(length), 2))
+        np.testing.assert_array_equal(packed.positions, np.tile(sequence.positions, 2))
         np.testing.assert_array_equal(packed.labels, np.tile(sequence.labels, 2))
 
     def test_passes_per_sample_tools_to_renderer(self):
         sample = {"messages": self.messages, "tools": [{"name": "lookup"}]}
-        renderer = object()
+        renderer = SimpleNamespace(effective_thinking_retention="all")
         config = ChatProcessor.Config(
             messages_fn=lambda row: row["messages"],
             tools_fn=lambda row: row["tools"],
