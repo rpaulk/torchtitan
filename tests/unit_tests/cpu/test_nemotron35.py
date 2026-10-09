@@ -176,3 +176,33 @@ def test_from_hf_refuses_unmapped_and_incomplete_experts() -> None:
     }
     with pytest.raises(ValueError):
         NemotronStateDictAdapter(config, None).from_hf(missing_expert)
+
+
+def test_mamba_scan_resets_state_at_packed_document_boundaries():
+    """A packed row must equal its documents scanned separately (no state leak)."""
+    import torch
+    from torchtitan.models.nemotron35 import mamba as M
+
+    torch.manual_seed(0)
+    T1, T2, H, P, N, chunk = 37, 50, 4, 8, 16, 16
+    T = T1 + T2
+    x = torch.randn(1, T, H, P)
+    dt = torch.rand(1, T, H) * 0.1 + 0.01
+    A = -torch.rand(H)
+    B, C = torch.randn(1, T, 1, N), torch.randn(1, T, 1, N)
+    D = torch.randn(H)
+    positions = torch.cat([torch.arange(T1), torch.arange(T2)])
+    seq_idx = M.seq_idx_from_positions(positions, 1, T)
+    assert seq_idx.tolist() == [[0] * T1 + [1] * T2]
+
+    packed = M.mamba2_scan(x, dt, A, B, C, chunk, D=D, seq_idx=seq_idx)
+    separate = torch.cat(
+        [
+            M.mamba2_scan(x[:, s], dt[:, s], A, B[:, s], C[:, s], chunk, D=D)
+            for s in (slice(0, T1), slice(T1, T))
+        ],
+        dim=1,
+    )
+    torch.testing.assert_close(packed, separate)
+    leaked = M.mamba2_scan(x, dt, A, B, C, chunk, D=D)
+    assert not torch.allclose(leaked[:, T1:], separate[:, T1:])

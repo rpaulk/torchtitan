@@ -27,6 +27,7 @@ from torchtitan.models.common.decoder_sharding import (
     set_decoder_sharding_config,
     set_gqa_attention_sharding,
     set_gqa_inner_attention_local_spmd,
+    token_id_placement,
 )
 from torchtitan.models.common.moe_sharding import (
     set_routed_moe_sharding_config,
@@ -55,8 +56,10 @@ def _set_mamba_sharding(mamba_cfg, *, enable_sp: bool) -> None:
     param = dense_param_placement(tp=tp_type)
     mamba_cfg.sharding_config = ShardingConfig(
         state_shardings={"A_log": param, "D": param, "dt_bias": param},
-        in_src_shardings={"x": layer_layout},
-        in_dst_shardings={"x": full_layout},
+        # positions (decoder input placement: full sequence, TP-replicated)
+        # feed Mamba's per-document seq_idx; the scan needs all of them.
+        in_src_shardings={"x": layer_layout, "positions": token_id_placement()},
+        in_dst_shardings={"x": full_layout, "positions": token_id_placement()},
         out_src_shardings=full_layout,
         out_dst_shardings=layer_layout,
         local_spmd=True,

@@ -224,8 +224,14 @@ def mamba2_scan(
     C: torch.Tensor,
     chunk_size: int,
     D: torch.Tensor | None = None,
+    seq_idx: torch.Tensor | None = None,
 ):
     """Mamba-2 chunked scan: fused Triton kernel when possible, else PyTorch.
+
+    ``seq_idx`` ([B, T] int32, non-decreasing) marks packed documents; the
+    recurrent state is reset wherever it changes so no state crosses a
+    document boundary. The PyTorch reference handles it by scanning each
+    document separately.
 
     Both paths take the same arguments and return the same [B, T, H, P] tensor.
     ``dt`` must already have its bias, softplus, and clamp applied by the
@@ -246,8 +252,45 @@ def mamba2_scan(
             chunk_size=chunk_size,
             D=D,
             dt_softplus=False,
+            seq_idx=seq_idx,
         )
-    return mamba2_chunk_scan(hidden_states, dt, A, B, C, chunk_size, D=D)
+    if seq_idx is None:
+        return mamba2_chunk_scan(hidden_states, dt, A, B, C, chunk_size, D=D)
+    return _per_document(
+        lambda s: mamba2_chunk_scan(
+            hidden_states[:, s], dt[:, s], A, B[:, s], C[:, s], chunk_size, D=D
+        ),
+        seq_idx,
+    )
+
+
+def _document_slices(seq_idx: torch.Tensor) -> list[slice]:
+    """Contiguous document spans along T; every batch row must share them."""
+    if seq_idx.shape[0] != 1 and not torch.equal(
+        seq_idx, seq_idx[:1].expand_as(seq_idx)
+    ):
+        raise NotImplementedError(
+            "reference Mamba path needs identical document boundaries across "
+            "the batch; use the fused kernels or batch size 1"
+        )
+    starts = torch.nonzero(torch.diff(seq_idx[0]) != 0).flatten() + 1
+    bounds = [0, *starts.tolist(), seq_idx.shape[1]]
+    return [slice(a, b) for a, b in zip(bounds[:-1], bounds[1:])]
+
+
+def _per_document(fn, seq_idx: torch.Tensor) -> torch.Tensor:
+    return torch.cat([fn(s) for s in _document_slices(seq_idx)], dim=1)
+
+
+def seq_idx_from_positions(
+    positions: torch.Tensor | None, batch: int, length: int
+) -> torch.Tensor | None:
+    """Per-token document index for packed rows: a new document starts at 0."""
+    if positions is None:
+        return None
+    positions = positions.reshape(-1, length).expand(batch, length)
+    seq_idx = torch.cumsum((positions == 0).to(torch.int32), dim=-1) - 1
+    return seq_idx.clamp_(min=0).to(torch.int32).contiguous()
 
 
 
@@ -348,11 +391,16 @@ class Mamba2Mixer(Module):
         self.norm = config.norm.build()
         self.out_proj = config.out_proj.build()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, positions: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """``positions`` (packed per-document positions) resets conv and SSM
+        state at each document start, matching attention's document mask."""
         flattened = x.dim() == 2
         if flattened:
             x = x.unsqueeze(0)
         B, L, _ = x.shape
+        seq_idx = seq_idx_from_positions(positions, B, L)
 
         z, x_bc, dt = torch.split(
             self.in_proj(x),
@@ -362,11 +410,23 @@ class Mamba2Mixer(Module):
 
         x_bc = x_bc.transpose(1, 2)
         if _fused_causal_conv is not None and x_bc.is_cuda:
+            # seq_idx requires channel-last x; the transposed in_proj slice is.
             x_bc = _fused_causal_conv(
-                x_bc, self.conv1d.weight.squeeze(1), self.conv1d.bias, activation="silu"
+                x_bc,
+                self.conv1d.weight.squeeze(1),
+                self.conv1d.bias,
+                seq_idx=seq_idx,
+                activation="silu",
             ).transpose(1, 2)
-        else:
+        elif seq_idx is None:
             x_bc = F.silu(self.conv1d(x_bc)[:, :, :L].transpose(1, 2))
+        else:
+            x_bc = _per_document(
+                lambda s: F.silu(
+                    self.conv1d(x_bc[:, :, s])[:, :, : s.stop - s.start].transpose(1, 2)
+                ),
+                seq_idx,
+            )
 
         gs = self.n_groups * self.state_dim
         x_m, B_p, C_p = torch.split(x_bc, [self.intermediate_size, gs, gs], dim=-1)
@@ -379,7 +439,7 @@ class Mamba2Mixer(Module):
 
         y = mamba2_scan(
             x_m.reshape(B, L, self.num_heads, self.head_dim),
-            dt, A, B_p, C_p, self.chunk_size, D=self.D,
+            dt, A, B_p, C_p, self.chunk_size, D=self.D, seq_idx=seq_idx,
         )
         y = y.reshape(B, L, -1).to(x_bc.dtype)
         out = self.out_proj(self.norm(y, z))

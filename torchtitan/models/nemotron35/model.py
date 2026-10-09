@@ -127,7 +127,7 @@ class NemotronBlock(Module):
     ) -> torch.Tensor:
         h = self.norm(x)
         if self.block_type == "mamba":
-            out = self.mamba(h)
+            out = self.mamba(h, positions)
         elif self.block_type == "attention":
             out = self.attention(h, attention_metadata, positions)
         elif self.block_type == "mlp":
